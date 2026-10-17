@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "CalorieTracker"
+rootProject.name = "SnapCal-AI"
 include(":app")
