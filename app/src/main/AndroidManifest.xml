@@ -5,6 +5,8 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@drawable/ic_launcher_background"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="NutriLens AI"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">

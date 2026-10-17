@@ -3,14 +3,15 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("com.google.devtools.ksp")
     id("org.jetbrains.kotlin.plugin.serialization")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
-    namespace = "com.example.calorietracker"
+    namespace = "si.kalin.nutrilensai"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.calorietracker"
+        applicationId = "si.kalin.nutrilensai"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
@@ -19,9 +20,6 @@ android {
 
     buildFeatures {
         compose = true
-    }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.11"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -49,7 +47,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 
     // Room Local SQLite Database
-    val roomVersion = "2.6.1"
+    val roomVersion = "2.8.5"
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")
