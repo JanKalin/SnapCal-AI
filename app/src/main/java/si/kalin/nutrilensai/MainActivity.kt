@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -70,13 +71,22 @@ import kotlin.math.roundToInt
 // ============================================================================
 
 @Serializable
+data class FoodCropBox(
+    val top: Double = 0.0,
+    val left: Double = 0.0,
+    val bottom: Double = 1.0,
+    val right: Double = 1.0
+)
+
+@Serializable
 data class AiMealAnalysis(
     val mealDescription: String = "Detected Meal",
     val totalCalories: Double = 0.0,
     val proteinGrams: Double = 0.0,
     val carbsGrams: Double = 0.0,
     val fatGrams: Double = 0.0,
-    val confidenceNote: String = ""
+    val confidenceNote: String = "",
+    val cropBox: FoodCropBox? = null
 ) {
     val totalCaloriesInt: Int get() = Math.round(totalCalories).toInt()
     val proteinGramsInt: Int get() = Math.round(proteinGrams).toInt()
@@ -125,7 +135,7 @@ interface MealDao {
     @Delete
     suspend fun deleteMeal(meal: MealEntry)
 
-    @Query("SELECT * FROM meal_entries WHERE dateString = :date ORDER BY timestamp DESC")
+    @Query("SELECT * FROM meal_entries WHERE dateString = :date ORDER BY timestamp ASC")
     fun getMealsForDate(date: String): Flow<List<MealEntry>>
 
     @Query("SELECT * FROM meal_entries")
@@ -192,6 +202,8 @@ class FoodVisionService {
             Identify all visible food items, estimate their portion sizes based on standard tableware,
             and calculate the combined total calories and macronutrients.
             
+            Also provide a bounding box `cropBox` enclosing all visible food, plates, bowls, dishes, and drinks, normalized from 0.0 to 1.0 (top, left, bottom, right). Leave slight padding around the tableware if possible.
+            
             Return ONLY a valid JSON object matching this exact structure:
             {
               "mealDescription": "Concise name of the meal and components",
@@ -199,7 +211,13 @@ class FoodVisionService {
               "proteinGrams": 0,
               "carbsGrams": 0,
               "fatGrams": 0,
-              "confidenceNote": "Brief note on portion assumptions made"
+              "confidenceNote": "Brief note on portion assumptions made",
+              "cropBox": {
+                "top": 0.1,
+                "left": 0.1,
+                "bottom": 0.9,
+                "right": 0.9
+              }
             }
         """.trimIndent()
 
@@ -238,6 +256,28 @@ fun createImageFile(context: Context): File {
     val timeStamp: String = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
     val storageDir = File(context.filesDir, "images").apply { mkdirs() }
     return File.createTempFile("JPEG_${timeStamp}_", ".jpg", storageDir)
+}
+
+fun cropBitmapToBoundingBox(originalBitmap: Bitmap, cropBox: FoodCropBox): Bitmap {
+    val origW = originalBitmap.width
+    val origH = originalBitmap.height
+
+    // Clamp coordinates to [0.0, 1.0]
+    val topF = cropBox.top.coerceIn(0.0, 0.95)
+    val leftF = cropBox.left.coerceIn(0.0, 0.95)
+    val bottomF = cropBox.bottom.coerceIn(topF + 0.05, 1.0)
+    val rightF = cropBox.right.coerceIn(leftF + 0.05, 1.0)
+
+    val x = (leftF * origW).toInt().coerceIn(0, origW - 1)
+    val y = (topF * origH).toInt().coerceIn(0, origH - 1)
+    val width = ((rightF - leftF) * origW).toInt().coerceIn(1, origW - x)
+    val height = ((bottomF - topF) * origH).toInt().coerceIn(1, origH - y)
+
+    return try {
+        Bitmap.createBitmap(originalBitmap, x, y, width, height)
+    } catch (e: Exception) {
+        originalBitmap
+    }
 }
 
 suspend fun cleanupOldImages(context: Context, days: Int, dao: MealDao) {
@@ -330,7 +370,7 @@ class CalorieViewModel(
     val allMeals: StateFlow<List<MealEntry>> = dao.getAllMealsFlow()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     
-    fun processNewImage(imagePath: String, apiKey: String, userNote: String, mealGroupingWindowMinutes: Int, capturedTimestamp: Long = System.currentTimeMillis()) {
+    fun processNewImage(imagePath: String, apiKey: String, userNote: String, mealGroupingWindowMinutes: Int, capturedTimestamp: Long = System.currentTimeMillis(), autoCrop: Boolean = false) {
         // Find existing meal within the time window on the same date
         val capturedDate = Instant.ofEpochMilli(capturedTimestamp).atZone(ZoneId.systemDefault()).toLocalDate()
         val windowMillis = mealGroupingWindowMinutes * 60 * 1000L
@@ -356,10 +396,10 @@ class CalorieViewModel(
         updatingMealTarget = null
         isSameDishMode = false
         pendingTimestamp = capturedTimestamp
-        analyzePhoto(apiKey, imagePath, userNote)
+        analyzePhoto(apiKey, imagePath, userNote, autoCrop)
     }
     
-    fun onMealGroupChoice(choice: MealGroupChoice, imagePath: String, targetMeal: MealEntry?, capturedTimestamp: Long, apiKey: String, userNote: String) {
+    fun onMealGroupChoice(choice: MealGroupChoice, imagePath: String, targetMeal: MealEntry?, capturedTimestamp: Long, apiKey: String, userNote: String, autoCrop: Boolean = false) {
         askSameDishDialogState = null
         pendingTimestamp = capturedTimestamp
         when (choice) {
@@ -372,7 +412,7 @@ class CalorieViewModel(
                     } else {
                         "Additional photo/angle of existing dish: ${targetMeal.description}"
                     }
-                    analyzePhoto(apiKey, imagePath, context)
+                    analyzePhoto(apiKey, imagePath, context, autoCrop)
                 }
             }
             MealGroupChoice.ADD_DISH_TO_MEAL -> {
@@ -384,7 +424,7 @@ class CalorieViewModel(
                     } else {
                         "Another dish in the same meal (${targetMeal.description})"
                     }
-                    analyzePhoto(apiKey, imagePath, context)
+                    analyzePhoto(apiKey, imagePath, context, autoCrop)
                 }
             }
             MealGroupChoice.NEW_MEAL -> {
@@ -394,12 +434,12 @@ class CalorieViewModel(
                 if (_selectedDate.value != capturedDate) {
                     _selectedDate.value = capturedDate
                 }
-                analyzePhoto(apiKey, imagePath, userNote)
+                analyzePhoto(apiKey, imagePath, userNote, autoCrop)
             }
         }
     }
 
-    private fun analyzePhoto(apiKey: String, imagePath: String, contextNote: String) {
+    private fun analyzePhoto(apiKey: String, imagePath: String, contextNote: String, autoCrop: Boolean = false) {
         viewModelScope.launch {
             isAnalyzing = true
             errorMessage = null
@@ -413,6 +453,19 @@ class CalorieViewModel(
             
             val result = visionService.analyzeFoodImage(apiKey, bitmap, contextNote)
             result.onSuccess { analysis ->
+                if (autoCrop && analysis.cropBox != null) {
+                    try {
+                        val cropped = cropBitmapToBoundingBox(bitmap, analysis.cropBox)
+                        if (cropped != bitmap) {
+                            FileOutputStream(File(imagePath)).use { out ->
+                                cropped.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+
                 val target = updatingMealTarget
                 if (target != null) {
                     if (isSameDishMode) {
@@ -580,6 +633,8 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
     var dailyGoal by remember { mutableIntStateOf(prefs.getInt("daily_goal", 2200)) }
     var mealGroupingWindowMinutes by remember { mutableIntStateOf(prefs.getInt("meal_grouping_window_minutes", 60)) }
     var imageDownscaleDays by remember { mutableIntStateOf(prefs.getInt("image_downscale_days", 7)) }
+    var autoCropFood by remember { mutableStateOf(prefs.getBoolean("auto_crop_food", true)) }
+    var sortAscendingAndScrollBottom by remember { mutableStateOf(prefs.getBoolean("sort_ascending_scroll_bottom", true)) }
     
     var showSettingsDialog by remember { mutableStateOf(apiKey.isBlank()) }
     var showMonthlySummaryDialog by remember { mutableStateOf(false) }
@@ -603,7 +658,7 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
     ) { success: Boolean ->
         if (success) {
             tempCameraFile?.absolutePath?.let { path ->
-                viewModel.processNewImage(path, apiKey, userNote, mealGroupingWindowMinutes)
+                viewModel.processNewImage(path, apiKey, userNote, mealGroupingWindowMinutes, autoCrop = autoCropFood)
                 userNote = ""
             }
         }
@@ -650,7 +705,7 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                 }
             }
             val finalTimestamp = photoTimestamp ?: System.currentTimeMillis()
-            viewModel.processNewImage(newFile.absolutePath, apiKey, userNote, mealGroupingWindowMinutes, finalTimestamp)
+            viewModel.processNewImage(newFile.absolutePath, apiKey, userNote, mealGroupingWindowMinutes, finalTimestamp, autoCrop = autoCropFood)
             userNote = ""
         }
     }
@@ -814,12 +869,28 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
             Text("Logged Meals", style = MaterialTheme.typography.titleMedium)
             Spacer(modifier = Modifier.height(8.dp))
 
+            // Displayed meals list according to sort preference
+            val displayedMeals = remember(meals, sortAscendingAndScrollBottom) {
+                if (sortAscendingAndScrollBottom) meals else meals.reversed()
+            }
+
+            // Logged Meals List State (scrolls to bottom on load/update if enabled)
+            val listState = rememberLazyListState()
+            LaunchedEffect(displayedMeals.size, selectedDate, sortAscendingAndScrollBottom) {
+                if (sortAscendingAndScrollBottom && displayedMeals.isNotEmpty()) {
+                    listState.scrollToItem(displayedMeals.size - 1)
+                } else if (!sortAscendingAndScrollBottom && displayedMeals.isNotEmpty()) {
+                    listState.scrollToItem(0)
+                }
+            }
+
             // Logged Meals List
             LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(meals, key = { it.id }) { meal ->
+                items(displayedMeals, key = { it.id }) { meal ->
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(14.dp).fillMaxWidth()) {
                             Row(
@@ -968,7 +1039,7 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                 Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Button(
                         onClick = {
-                            viewModel.onMealGroupChoice(MealGroupChoice.SAME_DISH, imagePath, targetMeal, capturedTimestamp, apiKey, userNote)
+                            viewModel.onMealGroupChoice(MealGroupChoice.SAME_DISH, imagePath, targetMeal, capturedTimestamp, apiKey, userNote, autoCrop = autoCropFood)
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -976,7 +1047,7 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                     }
                     Button(
                         onClick = {
-                            viewModel.onMealGroupChoice(MealGroupChoice.ADD_DISH_TO_MEAL, imagePath, targetMeal, capturedTimestamp, apiKey, userNote)
+                            viewModel.onMealGroupChoice(MealGroupChoice.ADD_DISH_TO_MEAL, imagePath, targetMeal, capturedTimestamp, apiKey, userNote, autoCrop = autoCropFood)
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -984,7 +1055,7 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                     }
                     OutlinedButton(
                         onClick = {
-                            viewModel.onMealGroupChoice(MealGroupChoice.NEW_MEAL, imagePath, targetMeal, capturedTimestamp, apiKey, userNote)
+                            viewModel.onMealGroupChoice(MealGroupChoice.NEW_MEAL, imagePath, targetMeal, capturedTimestamp, apiKey, userNote, autoCrop = autoCropFood)
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -1067,16 +1138,22 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
             currentGoal = dailyGoal,
             currentGroupingWindow = mealGroupingWindowMinutes,
             currentDownscaleDays = imageDownscaleDays,
-            onSave = { newKey, newGoal, newWindow, newDays ->
+            currentAutoCrop = autoCropFood,
+            currentSortAscending = sortAscendingAndScrollBottom,
+            onSave = { newKey, newGoal, newWindow, newDays, newAutoCrop, newSortAscending ->
                 apiKey = newKey
                 dailyGoal = newGoal
                 mealGroupingWindowMinutes = newWindow
                 imageDownscaleDays = newDays
+                autoCropFood = newAutoCrop
+                sortAscendingAndScrollBottom = newSortAscending
                 prefs.edit()
                     .putString("gemini_api_key", newKey)
                     .putInt("daily_goal", newGoal)
                     .putInt("meal_grouping_window_minutes", newWindow)
                     .putInt("image_downscale_days", newDays)
+                    .putBoolean("auto_crop_food", newAutoCrop)
+                    .putBoolean("sort_ascending_scroll_bottom", newSortAscending)
                     .apply()
                 showSettingsDialog = false
             },
@@ -1225,13 +1302,17 @@ fun SettingsDialog(
     currentGoal: Int,
     currentGroupingWindow: Int,
     currentDownscaleDays: Int,
-    onSave: (String, Int, Int, Int) -> Unit,
+    currentAutoCrop: Boolean,
+    currentSortAscending: Boolean,
+    onSave: (String, Int, Int, Int, Boolean, Boolean) -> Unit,
     onDismiss: () -> Unit
 ) {
     var keyInput by remember { mutableStateOf(currentApiKey) }
     var goalInput by remember { mutableStateOf(currentGoal.toString()) }
     var windowInput by remember { mutableStateOf(currentGroupingWindow.toString()) }
     var daysInput by remember { mutableStateOf(currentDownscaleDays.toString()) }
+    var autoCropInput by remember { mutableStateOf(currentAutoCrop) }
+    var sortAscendingInput by remember { mutableStateOf(currentSortAscending) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1266,6 +1347,42 @@ fun SettingsDialog(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Intelligent Plate Crop", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "Auto-crop photo around the plate/dishes using AI",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = autoCropInput,
+                        onCheckedChange = { autoCropInput = it }
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Sort Ascending & Scroll to Bottom", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "Morning meals at top, automatically scrolls to latest meal",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = sortAscendingInput,
+                        onCheckedChange = { sortAscendingInput = it }
+                    )
+                }
             }
         },
         confirmButton = {
@@ -1274,7 +1391,9 @@ fun SettingsDialog(
                     keyInput, 
                     goalInput.toIntOrNull() ?: 2200,
                     windowInput.toIntOrNull() ?: 60,
-                    daysInput.toIntOrNull() ?: 7
+                    daysInput.toIntOrNull() ?: 7,
+                    autoCropInput,
+                    sortAscendingInput
                 ) 
             }) {
                 Text("Save")
@@ -1284,6 +1403,33 @@ fun SettingsDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+}
+
+fun formatCaloriesToTwoSigFigs(calories: Int): String {
+    if (calories <= 0) return "0"
+    return when {
+        calories < 100 -> calories.toString()
+        calories < 1000 -> {
+            // Round to nearest 10 (e.g. 587 -> 590, 595 -> 600)
+            val rounded = (Math.round(calories / 10.0) * 10).toInt()
+            rounded.toString()
+        }
+        calories < 10000 -> {
+            // E.g. 1540 -> 1.5k, 2010 -> 2.0k or 2k
+            val inK = calories / 1000.0
+            val rounded100 = Math.round(inK * 10.0) / 10.0
+            if (rounded100 % 1.0 == 0.0) {
+                "${rounded100.toInt()}k"
+            } else {
+                "${rounded100}k"
+            }
+        }
+        else -> {
+            // >= 10,000 -> nearest whole k, e.g. 12k
+            val roundedK = Math.round(calories / 1000.0).toInt()
+            "${roundedK}k"
+        }
+    }
 }
 
 @Composable
@@ -1433,7 +1579,7 @@ fun MonthlySummaryDialog(
                                             )
                                             if (dayCalories > 0) {
                                                 Text(
-                                                    text = if (dayCalories >= 1000) "${dayCalories / 1000}k" else "$dayCalories",
+                                                    text = formatCaloriesToTwoSigFigs(dayCalories),
                                                     style = MaterialTheme.typography.labelSmall,
                                                     fontSize = androidx.compose.ui.unit.TextUnit(8.5f, androidx.compose.ui.unit.TextUnitType.Sp),
                                                     fontWeight = FontWeight.SemiBold,
