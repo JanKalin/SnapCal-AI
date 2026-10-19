@@ -1,5 +1,6 @@
 package si.kalin.nutrilensai
 
+import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -14,22 +15,30 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.launch
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -41,6 +50,14 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.room.*
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.Scope
+import com.google.api.services.drive.DriveScopes
+import si.kalin.nutrilensai.backup.BackupManager
+import si.kalin.nutrilensai.backup.DriveBackupWorker
 import com.google.ai.client.generativeai.GenerativeModel
 import com.google.ai.client.generativeai.type.content
 import com.google.ai.client.generativeai.type.generationConfig
@@ -165,6 +182,23 @@ abstract class AppDatabase : RoomDatabase() {
                 .build().also { INSTANCE = it }
             }
         }
+
+        fun checkpoint(context: Context) {
+            val db = getDatabase(context)
+            val supportDb = db.openHelper.writableDatabase
+            supportDb.query("PRAGMA wal_checkpoint(TRUNCATE)").use { cursor ->
+                cursor.moveToFirst()
+            }
+        }
+
+        fun closeAndReset() {
+            synchronized(this) {
+                if (INSTANCE?.isOpen == true) {
+                    INSTANCE?.close()
+                }
+                INSTANCE = null
+            }
+        }
     }
 }
 
@@ -231,6 +265,54 @@ class FoodVisionService {
             val jsonText = response.text ?: throw Exception("Empty response from Gemini")
             val parsed = jsonParser.decodeFromString<AiMealAnalysis>(jsonText)
             Result.success(parsed)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun detectPlateCropBox(apiKey: String, bitmap: Bitmap): Result<FoodCropBox> {
+        if (apiKey.isBlank()) {
+            return Result.failure(Exception("Missing Gemini API Key. Tap the gear icon to set it."))
+        }
+
+        val model = GenerativeModel(
+            modelName = "gemini-3.8-flash",
+            apiKey = apiKey.trim(),
+            generationConfig = generationConfig {
+                responseMimeType = "application/json"
+                temperature = 0.1f
+            }
+        )
+
+        val scaledBitmap = scaleBitmap(bitmap, 1024)
+
+        val prompt = """
+            Detect all food items, plates, bowls, dishes, and drinks in this image.
+            Provide a bounding box `cropBox` enclosing all of them, normalized from 0.0 to 1.0 (top, left, bottom, right).
+            Include a comfortable margin around the tableware and plates.
+            
+            Return ONLY a valid JSON object matching this exact structure:
+            {
+              "cropBox": {
+                "top": 0.05,
+                "left": 0.05,
+                "bottom": 0.95,
+                "right": 0.95
+              }
+            }
+        """.trimIndent()
+
+        return try {
+            val response = model.generateContent(
+                content {
+                    image(scaledBitmap)
+                    text(prompt)
+                }
+            )
+            val jsonText = response.text ?: throw Exception("Empty response from Gemini")
+            val parsed = jsonParser.decodeFromString<AiMealAnalysis>(jsonText)
+            val box = parsed.cropBox ?: throw Exception("No crop box detected in response")
+            Result.success(box)
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -321,7 +403,7 @@ suspend fun cleanupOldImages(context: Context, days: Int, dao: MealDao) {
 
 class CalorieViewModel(
     private val dao: MealDao,
-    private val visionService: FoodVisionService,
+    val visionService: FoodVisionService,
     private val context: Context
 ) : ViewModel() {
 
@@ -455,6 +537,11 @@ class CalorieViewModel(
             result.onSuccess { analysis ->
                 if (autoCrop && analysis.cropBox != null) {
                     try {
+                        val origFile = File(imagePath.replace(".jpg", "_orig.jpg"))
+                        if (!origFile.exists()) {
+                            File(imagePath).copyTo(origFile, overwrite = false)
+                        }
+
                         val cropped = cropBitmapToBoundingBox(bitmap, analysis.cropBox)
                         if (cropped != bitmap) {
                             FileOutputStream(File(imagePath)).use { out ->
@@ -569,6 +656,12 @@ class CalorieViewModel(
         pendingTimestamp = null
     }
 
+    fun updateMeal(meal: MealEntry) {
+        viewModelScope.launch {
+            dao.updateMeal(meal)
+        }
+    }
+
     fun deleteMeal(meal: MealEntry) {
         viewModelScope.launch {
             dao.deleteMeal(meal)
@@ -602,6 +695,9 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences("nutrilens_prefs", Context.MODE_PRIVATE)
         val imageDownscaleDays = prefs.getInt("image_downscale_days", 7)
 
+        // Schedule periodic Google Drive backup (WorkManager)
+        DriveBackupWorker.schedulePeriodicBackup(this)
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -625,7 +721,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
     val prefs = remember { context.getSharedPreferences("nutrilens_prefs", Context.MODE_PRIVATE) }
@@ -639,6 +735,7 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
     var showSettingsDialog by remember { mutableStateOf(apiKey.isBlank()) }
     var showMonthlySummaryDialog by remember { mutableStateOf(false) }
     var mealToDelete by remember { mutableStateOf<MealEntry?>(null) }
+    var editingMeal by remember { mutableStateOf<MealEntry?>(null) }
     var fullScreenImagePath by remember { mutableStateOf<String?>(null) }
 
     val selectedDate by viewModel.selectedDate.collectAsStateWithLifecycle()
@@ -891,14 +988,81 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(displayedMeals, key = { it.id }) { meal ->
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Column(modifier = Modifier.padding(14.dp).fillMaxWidth()) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .combinedClickable(
+                                onClick = { /* Normal tap */ },
+                                onLongClick = { editingMeal = meal }
+                            )
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp)
+                        ) {
+                            // 1. Full-width meal description
+                            Text(
+                                text = meal.description,
+                                fontWeight = FontWeight.SemiBold,
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+
+                            // 2. Photos (if any)
+                            if (meal.imagePaths.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                LazyRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    items(meal.imagePaths) { path ->
+                                        val bitmap = remember(path) {
+                                            val options = BitmapFactory.Options().apply {
+                                                inJustDecodeBounds = true
+                                                BitmapFactory.decodeFile(path, this)
+                                                val reqWidth = 200
+                                                val reqHeight = 200
+                                                var inSampleSize = 1
+                                                if (outHeight > reqHeight || outWidth > reqWidth) {
+                                                    val halfHeight = outHeight / 2
+                                                    val halfWidth = outWidth / 2
+                                                    while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
+                                                        inSampleSize *= 2
+                                                    }
+                                                }
+                                                inJustDecodeBounds = false
+                                                this.inSampleSize = inSampleSize
+                                            }
+                                            BitmapFactory.decodeFile(path, options)
+                                        }
+                                        if (bitmap != null) {
+                                            Image(
+                                                bitmap = bitmap.asImageBitmap(),
+                                                contentDescription = "Meal photo",
+                                                modifier = Modifier
+                                                    .size(60.dp)
+                                                    .clip(RoundedCornerShape(8.dp))
+                                                    .clickable { fullScreenImagePath = path },
+                                                contentScale = ContentScale.Crop
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Bottom Row: Left-aligned timestamps and macros, Right-aligned calories & action icons
+                            Spacer(modifier = Modifier.height(8.dp))
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                                ) {
                                     val timeFormat = remember { DateTimeFormatter.ofPattern("HH:mm") }
                                     val currentTimeStr = remember(meal.timestamp) {
                                         Instant.ofEpochMilli(meal.timestamp)
@@ -918,71 +1082,49 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                                         currentTimeStr
                                     }
 
-                                    Text(meal.description, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
-                                    Spacer(modifier = Modifier.height(2.dp))
                                     Text(
-                                        timeDisplay,
+                                        text = timeDisplay,
                                         style = MaterialTheme.typography.labelMedium,
                                         fontWeight = FontWeight.Medium,
                                         color = MaterialTheme.colorScheme.primary
                                     )
-                                    Spacer(modifier = Modifier.height(2.dp))
                                     Text(
-                                        "P: ${meal.protein}g  •  C: ${meal.carbs}g  •  F: ${meal.fat}g",
+                                        text = "p: ${meal.protein}g, c: ${meal.carbs}g, f: ${meal.fat}g",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
-                                Text(
-                                    "${meal.calories} kcal",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                IconButton(onClick = { mealToDelete = meal }) {
-                                    Icon(Icons.Default.Delete, contentDescription = "Delete")
-                                }
-                            }
-                            if (meal.imagePaths.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                LazyRow(
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(2.dp)
                                 ) {
-                                    items(meal.imagePaths) { path ->
-                                        val bitmap = remember(path) {
-                                        val options = BitmapFactory.Options().apply {
-                                            // Decode bounds first to get dimensions
-                                            inJustDecodeBounds = true
-                                            BitmapFactory.decodeFile(path, this)
-                                            
-                                            // Calculate inSampleSize
-                                            val reqWidth = 200 // Max thumbnail width
-                                            val reqHeight = 200 // Max thumbnail height
-                                            var inSampleSize = 1
-                                            
-                                            if (outHeight > reqHeight || outWidth > reqWidth) {
-                                                val halfHeight = outHeight / 2
-                                                val halfWidth = outWidth / 2
-                                                while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
-                                                    inSampleSize *= 2
-                                                }
-                                            }
-                                            
-                                            // Decode actual image with inSampleSize
-                                            inJustDecodeBounds = false
-                                            this.inSampleSize = inSampleSize
-                                        }
-                                        BitmapFactory.decodeFile(path, options)
+                                    Text(
+                                        text = "${meal.calories} kcal",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    IconButton(
+                                        onClick = { editingMeal = meal },
+                                        modifier = Modifier.size(36.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Edit,
+                                            contentDescription = "Edit Meal",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(19.dp)
+                                        )
                                     }
-                                        if (bitmap != null) {
-                                            Image(
-                                                bitmap = bitmap.asImageBitmap(),
-                                                contentDescription = "Meal photo",
-                                                modifier = Modifier
-                                                    .size(60.dp)
-                                                    .clickable { fullScreenImagePath = path },
-                                                contentScale = ContentScale.Crop
-                                            )
-                                        }
+                                    IconButton(
+                                        onClick = { mealToDelete = meal },
+                                        modifier = Modifier.size(36.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Delete,
+                                            contentDescription = "Delete",
+                                            tint = MaterialTheme.colorScheme.error.copy(alpha = 0.8f),
+                                            modifier = Modifier.size(19.dp)
+                                        )
                                     }
                                 }
                             }
@@ -1067,16 +1209,60 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
         )
     }
 
-    // Review & Edit AI Analysis Dialog
+    // Review & Edit AI Analysis Dialog (for newly captured photo)
     viewModel.pendingAnalysis?.let { analysis ->
         val initialTimestamp = viewModel.pendingTimestamp ?: System.currentTimeMillis()
+        val paths = viewModel.pendingImagePath?.let { listOf(it) } ?: emptyList()
         ReviewAnalysisDialog(
             analysis = analysis,
             initialTimestamp = initialTimestamp,
+            imagePaths = paths,
+            apiKey = apiKey,
+            visionService = viewModel.visionService,
+            title = "Review AI Estimate",
+            confirmButtonText = "Log Meal",
             onConfirm = { desc, cal, pro, carb, fat, timestamp ->
                 viewModel.confirmAndSaveMeal(desc, cal, pro, carb, fat, timestamp)
             },
             onDismiss = { viewModel.dismissPendingAnalysis() }
+        )
+    }
+
+    // Edit Existing Meal Dialog (from long-press or edit button)
+    editingMeal?.let { meal ->
+        ReviewAnalysisDialog(
+            analysis = AiMealAnalysis(
+                mealDescription = meal.description,
+                totalCalories = meal.calories.toDouble(),
+                proteinGrams = meal.protein.toDouble(),
+                carbsGrams = meal.carbs.toDouble(),
+                fatGrams = meal.fat.toDouble()
+            ),
+            initialTimestamp = meal.timestamp,
+            imagePaths = meal.imagePaths,
+            apiKey = apiKey,
+            visionService = viewModel.visionService,
+            title = "Review AI Estimate",
+            confirmButtonText = "Save Changes",
+            onConfirm = { desc, cal, pro, carb, fat, timestamp ->
+                val dateStr = Instant.ofEpochMilli(timestamp)
+                    .atZone(ZoneId.systemDefault())
+                    .toLocalDate()
+                    .toString()
+                viewModel.updateMeal(
+                    meal.copy(
+                        description = desc,
+                        calories = cal,
+                        protein = pro,
+                        carbs = carb,
+                        fat = fat,
+                        timestamp = timestamp,
+                        dateString = dateStr
+                    )
+                )
+                editingMeal = null
+            },
+            onDismiss = { editingMeal = null }
         )
     }
 
@@ -1157,6 +1343,10 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                     .apply()
                 showSettingsDialog = false
             },
+            onRestoreComplete = {
+                showSettingsDialog = false
+                (context as? Activity)?.recreate()
+            },
             onDismiss = { showSettingsDialog = false }
         )
     }
@@ -1181,9 +1371,17 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
 fun ReviewAnalysisDialog(
     analysis: AiMealAnalysis,
     initialTimestamp: Long = System.currentTimeMillis(),
+    imagePaths: List<String> = emptyList(),
+    apiKey: String = "",
+    visionService: FoodVisionService? = null,
+    title: String = "Review AI Estimate",
+    confirmButtonText: String = "Log Meal",
     onConfirm: (String, Int, Int, Int, Int, Long) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
     var desc by remember { mutableStateOf(analysis.mealDescription) }
     var calories by remember { mutableStateOf(analysis.totalCaloriesInt.toString()) }
     var protein by remember { mutableStateOf(analysis.proteinGramsInt.toString()) }
@@ -1197,11 +1395,250 @@ fun ReviewAnalysisDialog(
     var hourInput by remember { mutableStateOf(initialDateTime.format(DateTimeFormatter.ofPattern("HH"))) }
     var minuteInput by remember { mutableStateOf(initialDateTime.format(DateTimeFormatter.ofPattern("mm"))) }
 
+    // Selected image from list (default to first)
+    var selectedImagePath by remember(imagePaths) { mutableStateOf(imagePaths.firstOrNull()) }
+    var reloadTrigger by remember { mutableIntStateOf(0) }
+
+    val currentBitmap = remember(selectedImagePath, reloadTrigger) {
+        selectedImagePath?.let { path ->
+            try {
+                val options = BitmapFactory.Options().apply {
+                    inJustDecodeBounds = true
+                    BitmapFactory.decodeFile(path, this)
+                    var sampleSize = 1
+                    val maxDim = 1024
+                    if (outHeight > maxDim || outWidth > maxDim) {
+                        val halfHeight = outHeight / 2
+                        val halfWidth = outWidth / 2
+                        while (halfHeight / sampleSize >= maxDim && halfWidth / sampleSize >= maxDim) {
+                            sampleSize *= 2
+                        }
+                    }
+                    inJustDecodeBounds = false
+                    inSampleSize = sampleSize
+                }
+                BitmapFactory.decodeFile(path, options)
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
+    val origFile = remember(selectedImagePath, reloadTrigger) {
+        selectedImagePath?.let { path ->
+            val file = File(path.replace(".jpg", "_orig.jpg"))
+            if (file.exists()) file else null
+        }
+    }
+
+    var isCropping by remember { mutableStateOf(false) }
+    var cropStatusMessage by remember { mutableStateOf<String?>(null) }
+
+    // Gallery picker to replace incorrectly cropped photo with full original if needed
+    val pickOriginalLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri != null && selectedImagePath != null) {
+            try {
+                val destFile = File(selectedImagePath!!)
+                val backupOrig = File(selectedImagePath!!.replace(".jpg", "_orig.jpg"))
+
+                // Copy picked image to original backup AND active file
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(destFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                destFile.copyTo(backupOrig, overwrite = true)
+                reloadTrigger++
+                cropStatusMessage = "Loaded uncropped photo. You can use it as-is or tap 'Re-crop AI'."
+            } catch (e: Exception) {
+                cropStatusMessage = "Failed to load image: ${e.message}"
+            }
+        }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Review AI Estimate") },
+        title = { Text(title) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // Image Preview Card & Cropping Actions
+                if (currentBitmap != null && selectedImagePath != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
+                            // If multiple photos, let user choose which to view
+                            if (imagePaths.size > 1) {
+                                LazyRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.padding(bottom = 6.dp)
+                                ) {
+                                    items(imagePaths) { path ->
+                                        val isSel = path == selectedImagePath
+                                        val thumb = remember(path, reloadTrigger) {
+                                            try {
+                                                val opt = BitmapFactory.Options().apply { inSampleSize = 4 }
+                                                BitmapFactory.decodeFile(path, opt)
+                                            } catch (e: Exception) { null }
+                                        }
+                                        if (thumb != null) {
+                                            Image(
+                                                bitmap = thumb.asImageBitmap(),
+                                                contentDescription = null,
+                                                modifier = Modifier
+                                                    .size(44.dp)
+                                                    .clickable { selectedImagePath = path }
+                                                    .then(
+                                                        if (isSel) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(4.dp))
+                                                        else Modifier
+                                                    ),
+                                                contentScale = ContentScale.Crop
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(190.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Image(
+                                    bitmap = currentBitmap.asImageBitmap(),
+                                    contentDescription = "Meal photo preview",
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Fit
+                                )
+                            }
+
+                            if (cropStatusMessage != null) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    cropStatusMessage!!,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+
+                            if (isCropping) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            } else {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    // Button: Re-crop with AI
+                                    OutlinedButton(
+                                        onClick = {
+                                            if (apiKey.isBlank()) {
+                                                cropStatusMessage = "Gemini API key is required to re-crop."
+                                                return@OutlinedButton
+                                            }
+                                            if (visionService == null) {
+                                                cropStatusMessage = "Vision service not available."
+                                                return@OutlinedButton
+                                            }
+                                            isCropping = true
+                                            cropStatusMessage = "AI detecting plate & re-cropping..."
+                                            scope.launch {
+                                                val sourceBitmap = (if (origFile?.exists() == true) {
+                                                    BitmapFactory.decodeFile(origFile.absolutePath)
+                                                } else null) ?: BitmapFactory.decodeFile(selectedImagePath!!)
+
+                                                if (sourceBitmap == null) {
+                                                    cropStatusMessage = "Could not decode source photo."
+                                                    isCropping = false
+                                                    return@launch
+                                                }
+
+                                                val cropResult = visionService.detectPlateCropBox(apiKey, sourceBitmap)
+                                                cropResult.onSuccess { newBox ->
+                                                    try {
+                                                        // Ensure original is saved if not already
+                                                        val backupOrig = File(selectedImagePath!!.replace(".jpg", "_orig.jpg"))
+                                                        if (!backupOrig.exists()) {
+                                                            FileOutputStream(backupOrig).use { out ->
+                                                                sourceBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                                                            }
+                                                        }
+
+                                                        val newlyCropped = cropBitmapToBoundingBox(sourceBitmap, newBox)
+                                                        FileOutputStream(File(selectedImagePath!!)).use { out ->
+                                                            newlyCropped.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                                                        }
+                                                        reloadTrigger++
+                                                        cropStatusMessage = "Successfully re-cropped with AI!"
+                                                    } catch (e: Exception) {
+                                                        cropStatusMessage = "Error saving cropped photo: ${e.message}"
+                                                    }
+                                                }.onFailure { err ->
+                                                    cropStatusMessage = "Re-crop failed: ${err.message}"
+                                                }
+                                                isCropping = false
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f),
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(Icons.Default.Crop, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("Re-crop AI", style = MaterialTheme.typography.labelSmall)
+                                    }
+
+                                    // Button: Use Original / Pick Original
+                                    if (origFile?.exists() == true) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                try {
+                                                    val origBitmap = BitmapFactory.decodeFile(origFile.absolutePath)
+                                                    if (origBitmap != null) {
+                                                        origFile.copyTo(File(selectedImagePath!!), overwrite = true)
+                                                        reloadTrigger++
+                                                        cropStatusMessage = "Restored original uncropped photo."
+                                                    }
+                                                } catch (e: Exception) {
+                                                    cropStatusMessage = "Error restoring original: ${e.message}"
+                                                }
+                                            },
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
+                                        ) {
+                                            Icon(Icons.Default.CropFree, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("Use Original", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    } else {
+                                        OutlinedButton(
+                                            onClick = {
+                                                pickOriginalLauncher.launch(
+                                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                                )
+                                            },
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
+                                        ) {
+                                            Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("Pick Original", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if (analysis.confidenceNote.isNotBlank()) {
                     Text(
                         text = analysis.confidenceNote,
@@ -1209,16 +1646,19 @@ fun ReviewAnalysisDialog(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+
                 OutlinedTextField(
                     value = desc,
                     onValueChange = { desc = it },
-                    label = { Text("Meal Description") }
+                    label = { Text("Meal Description") },
+                    modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = calories,
                     onValueChange = { calories = it },
                     label = { Text("Calories (kcal)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth()
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
@@ -1287,7 +1727,7 @@ fun ReviewAnalysisDialog(
                     finalTimestamp
                 )
             }) {
-                Text("Log Meal")
+                Text(confirmButtonText)
             }
         },
         dismissButton = {
@@ -1305,6 +1745,7 @@ fun SettingsDialog(
     currentAutoCrop: Boolean,
     currentSortAscending: Boolean,
     onSave: (String, Int, Int, Int, Boolean, Boolean) -> Unit,
+    onRestoreComplete: () -> Unit,
     onDismiss: () -> Unit
 ) {
     var keyInput by remember { mutableStateOf(currentApiKey) }
@@ -1318,34 +1759,41 @@ fun SettingsDialog(
         onDismissRequest = onDismiss,
         title = { Text("Settings") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 OutlinedTextField(
                     value = keyInput,
                     onValueChange = { keyInput = it },
                     label = { Text("Gemini API Key") },
                     visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = goalInput,
                     onValueChange = { goalInput = it },
                     label = { Text("Daily Calorie Goal (kcal)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = windowInput,
                     onValueChange = { windowInput = it },
                     label = { Text("Meal Grouping Window (min)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = daysInput,
                     onValueChange = { daysInput = it },
                     label = { Text("Image Downscale After (days)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
                 )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1383,6 +1831,12 @@ fun SettingsDialog(
                         onCheckedChange = { sortAscendingInput = it }
                     )
                 }
+
+                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                GoogleDriveBackupSection(
+                    onRestoreComplete = onRestoreComplete
+                )
             }
         },
         confirmButton = {
@@ -1403,6 +1857,287 @@ fun SettingsDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+}
+
+@Composable
+fun GoogleDriveBackupSection(
+    onRestoreComplete: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val prefs = remember { context.getSharedPreferences("nutrilens_prefs", Context.MODE_PRIVATE) }
+
+    var autoBackupEnabled by remember {
+        mutableStateOf(prefs.getBoolean("auto_drive_backup_enabled", true))
+    }
+    var lastBackupTime by remember {
+        mutableLongStateOf(prefs.getLong("last_drive_backup_timestamp", 0L))
+    }
+    var currentAccount by remember {
+        mutableStateOf<GoogleSignInAccount?>(null)
+    }
+    var isOperating by remember { mutableStateOf(false) }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    var isSuccessStatus by remember { mutableStateOf(true) }
+    var showRestoreConfirm by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        val account = GoogleSignIn.getLastSignedInAccount(context)
+        if (account != null && GoogleSignIn.hasPermissions(account, Scope(DriveScopes.DRIVE_APPDATA))) {
+            currentAccount = account
+        }
+    }
+
+    val gso = remember {
+        GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestEmail()
+            .requestScopes(Scope(DriveScopes.DRIVE_APPDATA))
+            .build()
+    }
+    val googleSignInClient = remember { GoogleSignIn.getClient(context, gso) }
+
+    val signInLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+        try {
+            val account = task.getResult(ApiException::class.java)
+            currentAccount = account
+            statusMessage = "Connected as ${account.email}"
+            isSuccessStatus = true
+            if (autoBackupEnabled) {
+                DriveBackupWorker.schedulePeriodicBackup(context)
+            }
+        } catch (e: ApiException) {
+            statusMessage = "Sign-in failed (code ${e.statusCode}): ${e.message}"
+            isSuccessStatus = false
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.CloudSync,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Column {
+                Text(
+                    text = "Google Drive Backup",
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Text(
+                    text = "Private appDataFolder (Safe & Invisible)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        if (currentAccount == null) {
+            Text(
+                text = "Back up your meals, history, settings, and photos securely to Google Drive. Sign in to enable automatic backups.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Button(
+                onClick = { signInLauncher.launch(googleSignInClient.signInIntent) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.AccountCircle, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Connect Google Drive")
+            }
+        } else {
+            OutlinedCard(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Account",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = currentAccount?.email ?: "Connected",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                        TextButton(
+                            onClick = {
+                                googleSignInClient.signOut().addOnCompleteListener {
+                                    currentAccount = null
+                                    DriveBackupWorker.cancelPeriodicBackup(context)
+                                    statusMessage = "Signed out of Google Drive"
+                                    isSuccessStatus = true
+                                }
+                            },
+                            enabled = !isOperating
+                        ) {
+                            Text("Disconnect", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Auto Daily Backup",
+                                fontWeight = FontWeight.SemiBold,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                "Syncs photos and data (Mobile & Wi-Fi)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = autoBackupEnabled,
+                            onCheckedChange = { enabled ->
+                                autoBackupEnabled = enabled
+                                prefs.edit().putBoolean("auto_drive_backup_enabled", enabled).apply()
+                                if (enabled) {
+                                    DriveBackupWorker.schedulePeriodicBackup(context)
+                                } else {
+                                    DriveBackupWorker.cancelPeriodicBackup(context)
+                                }
+                            },
+                            enabled = !isOperating
+                        )
+                    }
+
+                    val lastBackupFormatted = remember(lastBackupTime) {
+                        if (lastBackupTime > 0L) {
+                            SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault()).format(Date(lastBackupTime))
+                        } else {
+                            "Never"
+                        }
+                    }
+                    Text(
+                        text = "Last backup: $lastBackupFormatted",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            if (isOperating) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = {
+                        val account = currentAccount ?: return@Button
+                        isOperating = true
+                        statusMessage = "Starting backup..."
+                        scope.launch {
+                            val res = BackupManager.performBackup(context, account) { msg ->
+                                statusMessage = msg
+                            }
+                            isOperating = false
+                            isSuccessStatus = res.success
+                            statusMessage = res.message
+                            if (res.success) {
+                                lastBackupTime = prefs.getLong("last_drive_backup_timestamp", 0L)
+                            }
+                        }
+                    },
+                    enabled = !isOperating,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Backup Now")
+                }
+
+                OutlinedButton(
+                    onClick = { showRestoreConfirm = true },
+                    enabled = !isOperating,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Restore")
+                }
+            }
+        }
+
+        if (statusMessage != null) {
+            Text(
+                text = statusMessage!!,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (isSuccessStatus) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+            )
+        }
+    }
+
+    if (showRestoreConfirm) {
+        AlertDialog(
+            onDismissRequest = { showRestoreConfirm = false },
+            icon = { Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("Restore from Google Drive?") },
+            text = {
+                Text(
+                    "Restoring will download all backed-up photos and overwrite your current meal entries and settings with the cloud backup. Do you want to continue?"
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showRestoreConfirm = false
+                        val account = currentAccount ?: return@Button
+                        isOperating = true
+                        statusMessage = "Starting restore..."
+                        scope.launch {
+                            val res = BackupManager.performRestore(context, account) { msg ->
+                                statusMessage = msg
+                            }
+                            isOperating = false
+                            isSuccessStatus = res.success
+                            statusMessage = res.message
+                            if (res.success) {
+                                onRestoreComplete()
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Overwrite & Restore")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRestoreConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 fun formatCaloriesToTwoSigFigs(calories: Int): String {
