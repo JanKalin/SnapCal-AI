@@ -50,6 +50,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInAccount
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
@@ -111,6 +113,26 @@ data class AiMealAnalysis(
     val fatGramsInt: Int get() = Math.round(fatGrams).toInt()
 }
 
+@Serializable
+data class DishEntry(
+    val imagePath: String? = null,
+    val description: String = "",
+    val calories: Int = 0,
+    val protein: Int = 0,
+    val carbs: Int = 0,
+    val fat: Int = 0,
+    val multiplier: Float = 1.0f,
+    val baseCalories: Int = 0,
+    val baseProtein: Int = 0,
+    val baseCarbs: Int = 0,
+    val baseFat: Int = 0
+) {
+    val effectiveBaseCalories: Int get() = if (baseCalories > 0) baseCalories else if (multiplier > 0f) (calories / multiplier).roundToInt() else calories
+    val effectiveBaseProtein: Int get() = if (baseProtein > 0) baseProtein else if (multiplier > 0f) (protein / multiplier).roundToInt() else protein
+    val effectiveBaseCarbs: Int get() = if (baseCarbs > 0) baseCarbs else if (multiplier > 0f) (carbs / multiplier).roundToInt() else carbs
+    val effectiveBaseFat: Int get() = if (baseFat > 0) baseFat else if (multiplier > 0f) (fat / multiplier).roundToInt() else fat
+}
+
 @Entity(tableName = "meal_entries")
 data class MealEntry(
     @PrimaryKey(autoGenerate = true) val id: Int = 0,
@@ -122,17 +144,67 @@ data class MealEntry(
     val protein: Int,
     val carbs: Int,
     val fat: Int,
-    val imagePaths: List<String> = emptyList()
-)
+    val imagePaths: List<String> = emptyList(),
+    val dishes: List<DishEntry> = emptyList()
+) {
+    fun getEffectiveDishes(): List<DishEntry> {
+        if (dishes.isNotEmpty()) return dishes
+        if (imagePaths.isEmpty() || imagePaths.size <= 1) {
+            return listOf(
+                DishEntry(
+                    imagePath = imagePaths.firstOrNull(),
+                    description = description,
+                    calories = calories,
+                    protein = protein,
+                    carbs = carbs,
+                    fat = fat,
+                    multiplier = 1.0f,
+                    baseCalories = calories,
+                    baseProtein = protein,
+                    baseCarbs = carbs,
+                    baseFat = fat
+                )
+            )
+        }
+        val descParts = description.split(" + ").map { it.trim() }
+        val count = imagePaths.size
+        return imagePaths.mapIndexed { index, path ->
+            val partDesc = descParts.getOrNull(index) ?: "Dish ${index + 1}"
+            DishEntry(
+                imagePath = path,
+                description = partDesc,
+                calories = calories / count,
+                protein = protein / count,
+                carbs = carbs / count,
+                fat = fat / count,
+                multiplier = 1.0f,
+                baseCalories = calories / count,
+                baseProtein = protein / count,
+                baseCarbs = carbs / count,
+                baseFat = fat / count
+            )
+        }
+    }
+}
 
 class Converters {
     @TypeConverter
-    fun fromStringList(value: List<String>): String {
-        return Json.encodeToString(value)
-    }
+    fun fromStringList(value: List<String>): String = Json.encodeToString(value)
 
     @TypeConverter
     fun toStringList(value: String): List<String> {
+        return try {
+            Json.decodeFromString(value)
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    @TypeConverter
+    fun fromDishList(value: List<DishEntry>): String = Json.encodeToString(value)
+
+    @TypeConverter
+    fun toDishList(value: String): List<DishEntry> {
         return try {
             Json.decodeFromString(value)
         } catch (e: Exception) {
@@ -162,7 +234,7 @@ interface MealDao {
     suspend fun getAllMeals(): List<MealEntry>
 }
 
-@Database(entities = [MealEntry::class], version = 3, exportSchema = false)
+@Database(entities = [MealEntry::class], version = 4, exportSchema = false)
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun mealDao(): MealDao
@@ -171,6 +243,12 @@ abstract class AppDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: AppDatabase? = null
 
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE meal_entries ADD COLUMN dishes TEXT NOT NULL DEFAULT '[]'")
+            }
+        }
+
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 Room.databaseBuilder(
@@ -178,6 +256,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "nutrilens_db"
                 )
+                .addMigrations(MIGRATION_3_4)
                 .fallbackToDestructiveMigration()
                 .build().also { INSTANCE = it }
             }
@@ -313,6 +392,50 @@ class FoodVisionService {
             val parsed = jsonParser.decodeFromString<AiMealAnalysis>(jsonText)
             val box = parsed.cropBox ?: throw Exception("No crop box detected in response")
             Result.success(box)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun analyzeFoodText(
+        apiKey: String,
+        textDescription: String
+    ): Result<AiMealAnalysis> {
+        if (apiKey.isBlank()) {
+            return Result.failure(Exception("Missing Gemini API Key. Tap the gear icon in the top right to set it."))
+        }
+
+        val model = GenerativeModel(
+            modelName = "gemini-3.8-flash",
+            apiKey = apiKey.trim(),
+            generationConfig = generationConfig {
+                responseMimeType = "application/json"
+                temperature = 0.2f
+            }
+        )
+
+        val prompt = """
+            Estimate the nutritional content for this described food or meal:
+            "$textDescription"
+            
+            Identify the food items, estimate reasonable portion sizes based on typical servings, and calculate the combined total calories and macronutrients (protein, carbs, fat in grams).
+            
+            Return ONLY a valid JSON object matching this exact structure:
+            {
+              "mealDescription": "Concise name of the meal and components",
+              "totalCalories": 0,
+              "proteinGrams": 0,
+              "carbsGrams": 0,
+              "fatGrams": 0,
+              "confidenceNote": "Brief note on portion assumptions made"
+            }
+        """.trimIndent()
+
+        return try {
+            val response = model.generateContent(prompt)
+            val jsonText = response.text ?: throw Exception("Empty response from Gemini")
+            val parsed = jsonParser.decodeFromString<AiMealAnalysis>(jsonText)
+            Result.success(parsed)
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -572,26 +695,10 @@ class CalorieViewModel(
                             confidenceNote = combinedNote
                         )
                     } else {
-                        // Additional dish in same meal: Sum macros and append description
-                        val combinedCalories = (target.calories + analysis.totalCalories)
-                        val combinedProtein = (target.protein + analysis.proteinGrams)
-                        val combinedCarbs = (target.carbs + analysis.carbsGrams)
-                        val combinedFat = (target.fat + analysis.fatGrams)
-                        val combinedDescription = if (target.description.isNotBlank()) {
-                            "${target.description} + ${analysis.mealDescription}"
-                        } else {
-                            analysis.mealDescription
-                        }
-                        val combinedNote = "Added to meal: ${analysis.mealDescription} (${Math.round(analysis.totalCalories)} kcal). " + analysis.confidenceNote
-
-                        pendingAnalysis = AiMealAnalysis(
-                            mealDescription = combinedDescription,
-                            totalCalories = combinedCalories,
-                            proteinGrams = combinedProtein,
-                            carbsGrams = combinedCarbs,
-                            fatGrams = combinedFat,
-                            confidenceNote = combinedNote
-                        )
+                        // Another dish in same meal:
+                        // Keep pendingAnalysis focused on THIS new dish!
+                        // This allows applying the quantity multiplier specifically to THIS dish (e.g. 8x for 1/8 meat)
+                        pendingAnalysis = analysis
                     }
                 } else {
                     pendingAnalysis = analysis
@@ -605,29 +712,116 @@ class CalorieViewModel(
         }
     }
 
-    fun confirmAndSaveMeal(description: String, calories: Int, protein: Int, carbs: Int, fat: Int, timestamp: Long) {
+    fun confirmAndSaveMeal(
+        description: String,
+        calories: Int,
+        protein: Int,
+        carbs: Int,
+        fat: Int,
+        timestamp: Long,
+        multiplier: Float = 1.0f,
+        baseCalories: Int = calories,
+        baseProtein: Int = protein,
+        baseCarbs: Int = carbs,
+        baseFat: Int = fat
+    ) {
         viewModelScope.launch {
             val target = updatingMealTarget
             if (target != null) {
-                val updatedPaths = if (pendingImagePath != null && !target.imagePaths.contains(pendingImagePath)) {
-                    target.imagePaths + pendingImagePath!!
+                if (isSameDishMode) {
+                    val updatedPaths = if (pendingImagePath != null && !target.imagePaths.contains(pendingImagePath)) {
+                        target.imagePaths + pendingImagePath!!
+                    } else {
+                        target.imagePaths
+                    }
+                    val existingDishes = target.getEffectiveDishes()
+                    val updatedDishes = if (existingDishes.isNotEmpty()) {
+                        existingDishes.mapIndexed { index, dish ->
+                            if (index == 0) {
+                                dish.copy(
+                                    description = description,
+                                    calories = calories,
+                                    protein = protein,
+                                    carbs = carbs,
+                                    fat = fat,
+                                    multiplier = multiplier,
+                                    baseCalories = baseCalories,
+                                    baseProtein = baseProtein,
+                                    baseCarbs = baseCarbs,
+                                    baseFat = baseFat
+                                )
+                            } else dish
+                        }
+                    } else emptyList()
+
+                    dao.updateMeal(
+                        target.copy(
+                            description = description,
+                            calories = calories,
+                            protein = protein,
+                            carbs = carbs,
+                            fat = fat,
+                            timestamp = timestamp,
+                            imagePaths = updatedPaths,
+                            dishes = updatedDishes
+                        )
+                    )
                 } else {
-                    target.imagePaths
-                }
-                dao.updateMeal(
-                    target.copy(
+                    // Adding dish to existing meal:
+                    // 'description', 'calories', 'protein', 'carbs', 'fat' are for THIS newly added dish (multiplied by user)
+                    val newDish = DishEntry(
+                        imagePath = pendingImagePath,
                         description = description,
                         calories = calories,
                         protein = protein,
                         carbs = carbs,
                         fat = fat,
-                        timestamp = timestamp,
-                        imagePaths = updatedPaths
+                        multiplier = multiplier,
+                        baseCalories = baseCalories,
+                        baseProtein = baseProtein,
+                        baseCarbs = baseCarbs,
+                        baseFat = baseFat
                     )
-                )
+                    val updatedDishes = target.getEffectiveDishes() + newDish
+                    val combinedDesc = if (target.description.isNotBlank()) {
+                        "${target.description} + $description"
+                    } else {
+                        description
+                    }
+                    val updatedPaths = if (pendingImagePath != null && !target.imagePaths.contains(pendingImagePath)) {
+                        target.imagePaths + pendingImagePath!!
+                    } else {
+                        target.imagePaths
+                    }
+                    dao.updateMeal(
+                        target.copy(
+                            description = combinedDesc,
+                            calories = target.calories + calories,
+                            protein = target.protein + protein,
+                            carbs = target.carbs + carbs,
+                            fat = target.fat + fat,
+                            timestamp = timestamp,
+                            imagePaths = updatedPaths,
+                            dishes = updatedDishes
+                        )
+                    )
+                }
             } else {
                 val paths = pendingImagePath?.let { listOf(it) } ?: emptyList()
                 val dateString = Instant.ofEpochMilli(timestamp).atZone(ZoneId.systemDefault()).toLocalDate().toString()
+                val newDish = DishEntry(
+                    imagePath = pendingImagePath,
+                    description = description,
+                    calories = calories,
+                    protein = protein,
+                    carbs = carbs,
+                    fat = fat,
+                    multiplier = multiplier,
+                    baseCalories = baseCalories,
+                    baseProtein = baseProtein,
+                    baseCarbs = baseCarbs,
+                    baseFat = baseFat
+                )
                 dao.insertMeal(
                     MealEntry(
                         timestamp = timestamp,
@@ -638,7 +832,8 @@ class CalorieViewModel(
                         protein = protein,
                         carbs = carbs,
                         fat = fat,
-                        imagePaths = paths
+                        imagePaths = paths,
+                        dishes = listOf(newDish)
                     )
                 )
             }
@@ -659,6 +854,81 @@ class CalorieViewModel(
     fun updateMeal(meal: MealEntry) {
         viewModelScope.launch {
             dao.updateMeal(meal)
+        }
+    }
+
+    fun insertManualMeal(
+        description: String,
+        calories: Int,
+        protein: Int,
+        carbs: Int,
+        fat: Int,
+        targetDate: LocalDate,
+        hour: Int,
+        minute: Int,
+        multiplier: Float = 1.0f,
+        baseCalories: Int = calories,
+        baseProtein: Int = protein,
+        baseCarbs: Int = carbs,
+        baseFat: Int = fat
+    ) {
+        viewModelScope.launch {
+            val localTime = LocalTime.of(hour.coerceIn(0, 23), minute.coerceIn(0, 59))
+            val targetDateTime = LocalDateTime.of(targetDate, localTime)
+            val timestamp = targetDateTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+            val dish = DishEntry(
+                imagePath = null,
+                description = description,
+                calories = calories,
+                protein = protein,
+                carbs = carbs,
+                fat = fat,
+                multiplier = multiplier,
+                baseCalories = baseCalories,
+                baseProtein = baseProtein,
+                baseCarbs = baseCarbs,
+                baseFat = baseFat
+            )
+
+            val mealEntry = MealEntry(
+                timestamp = timestamp,
+                initialTimestamp = timestamp,
+                dateString = targetDate.toString(),
+                description = description,
+                calories = calories,
+                protein = protein,
+                carbs = carbs,
+                fat = fat,
+                imagePaths = emptyList(),
+                dishes = listOf(dish)
+            )
+
+            dao.insertMeal(mealEntry)
+            _selectedDate.value = targetDate
+        }
+    }
+
+    fun duplicateMeal(meal: MealEntry, targetDate: LocalDate, targetHour: Int, targetMinute: Int) {
+        viewModelScope.launch {
+            val localTime = LocalTime.of(targetHour.coerceIn(0, 23), targetMinute.coerceIn(0, 59))
+            val targetDateTime = LocalDateTime.of(targetDate, localTime)
+            val newTimestamp = targetDateTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+            val duplicatedMeal = MealEntry(
+                timestamp = newTimestamp,
+                initialTimestamp = newTimestamp,
+                dateString = targetDate.toString(),
+                description = meal.description,
+                calories = meal.calories,
+                protein = meal.protein,
+                carbs = meal.carbs,
+                fat = meal.fat,
+                imagePaths = meal.imagePaths,
+                dishes = meal.dishes
+            )
+            dao.insertMeal(duplicatedMeal)
+            _selectedDate.value = targetDate
         }
     }
 
@@ -736,6 +1006,8 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
     var showMonthlySummaryDialog by remember { mutableStateOf(false) }
     var mealToDelete by remember { mutableStateOf<MealEntry?>(null) }
     var editingMeal by remember { mutableStateOf<MealEntry?>(null) }
+    var mealToDuplicate by remember { mutableStateOf<MealEntry?>(null) }
+    var showManualEntryDialog by remember { mutableStateOf(false) }
     var fullScreenImagePath by remember { mutableStateOf<String?>(null) }
 
     val selectedDate by viewModel.selectedDate.collectAsStateWithLifecycle()
@@ -902,10 +1174,10 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Action Buttons (Camera & Gallery)
+            // Action Buttons (Camera, Gallery & Manual Entry)
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Button(
                     onClick = {
@@ -919,11 +1191,12 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                         cameraLauncher.launch(uri)
                     },
                     enabled = !viewModel.isAnalyzing,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
                 ) {
-                    Icon(Icons.Default.PhotoCamera, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Camera")
+                    Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Camera", maxLines = 1)
                 }
 
                 OutlinedButton(
@@ -933,11 +1206,23 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                         )
                     },
                     enabled = !viewModel.isAnalyzing,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
                 ) {
-                    Icon(Icons.Default.PhotoLibrary, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Gallery")
+                    Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Gallery", maxLines = 1)
+                }
+
+                OutlinedButton(
+                    onClick = { showManualEntryDialog = true },
+                    enabled = !viewModel.isAnalyzing,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
+                ) {
+                    Icon(Icons.Default.EditNote, contentDescription = null, modifier = Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Manual", maxLines = 1)
                 }
             }
 
@@ -1008,6 +1293,39 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                                 style = MaterialTheme.typography.titleMedium,
                                 modifier = Modifier.fillMaxWidth()
                             )
+
+                            // Multiplier badges if any dish has a non-1.0x multiplier
+                            val multipliers = remember(meal.dishes, meal.calories) {
+                                meal.getEffectiveDishes().filter { Math.abs(it.multiplier - 1.0f) > 0.05f }
+                            }
+                            if (multipliers.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    multipliers.forEach { dish ->
+                                        val multLabel = if (dish.multiplier % 1f == 0f) "${dish.multiplier.toInt()}x" else "${dish.multiplier}x"
+                                        val textLabel = if (meal.getEffectiveDishes().size > 1 && dish.description.isNotBlank()) {
+                                            "${dish.description}: $multLabel portion"
+                                        } else {
+                                            "$multLabel portion"
+                                        }
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.tertiaryContainer,
+                                            shape = RoundedCornerShape(4.dp)
+                                        ) {
+                                            Text(
+                                                text = textLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                                fontWeight = FontWeight.SemiBold,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
 
                             // 2. Photos (if any)
                             if (meal.imagePaths.isNotEmpty()) {
@@ -1104,6 +1422,17 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
                                         style = MaterialTheme.typography.titleMedium,
                                         fontWeight = FontWeight.Bold
                                     )
+                                    IconButton(
+                                        onClick = { mealToDuplicate = meal },
+                                        modifier = Modifier.size(36.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ContentCopy,
+                                            contentDescription = "Duplicate Meal",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(19.dp)
+                                        )
+                                    }
                                     IconButton(
                                         onClick = { editingMeal = meal },
                                         modifier = Modifier.size(36.dp)
@@ -1213,16 +1542,20 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
     viewModel.pendingAnalysis?.let { analysis ->
         val initialTimestamp = viewModel.pendingTimestamp ?: System.currentTimeMillis()
         val paths = viewModel.pendingImagePath?.let { listOf(it) } ?: emptyList()
+        val target = viewModel.updatingMealTarget
+        val isAddingDish = target != null && !viewModel.isSameDishMode
+
         ReviewAnalysisDialog(
             analysis = analysis,
             initialTimestamp = initialTimestamp,
             imagePaths = paths,
             apiKey = apiKey,
             visionService = viewModel.visionService,
-            title = "Review AI Estimate",
-            confirmButtonText = "Log Meal",
-            onConfirm = { desc, cal, pro, carb, fat, timestamp ->
-                viewModel.confirmAndSaveMeal(desc, cal, pro, carb, fat, timestamp)
+            title = if (isAddingDish) "Review New Dish (Adding to Meal)" else "Review AI Estimate",
+            confirmButtonText = if (isAddingDish) "Add Dish to Meal" else "Log Meal",
+            targetMeal = if (isAddingDish) target else null,
+            onConfirm = { desc, cal, pro, carb, fat, timestamp, mult, baseCal, basePro, baseCarb, baseFat ->
+                viewModel.confirmAndSaveMeal(desc, cal, pro, carb, fat, timestamp, mult, baseCal, basePro, baseCarb, baseFat)
             },
             onDismiss = { viewModel.dismissPendingAnalysis() }
         )
@@ -1230,39 +1563,139 @@ fun CalorieTrackerApp(viewModel: CalorieViewModel, context: Context) {
 
     // Edit Existing Meal Dialog (from long-press or edit button)
     editingMeal?.let { meal ->
+        val dishes = remember(meal) { meal.getEffectiveDishes() }
+        var selectedDishIndex by remember { mutableIntStateOf(0) }
+        val currentDish = dishes.getOrNull(selectedDishIndex) ?: dishes.first()
+
         ReviewAnalysisDialog(
             analysis = AiMealAnalysis(
-                mealDescription = meal.description,
-                totalCalories = meal.calories.toDouble(),
-                proteinGrams = meal.protein.toDouble(),
-                carbsGrams = meal.carbs.toDouble(),
-                fatGrams = meal.fat.toDouble()
+                mealDescription = currentDish.description,
+                totalCalories = currentDish.effectiveBaseCalories.toDouble(),
+                proteinGrams = currentDish.effectiveBaseProtein.toDouble(),
+                carbsGrams = currentDish.effectiveBaseCarbs.toDouble(),
+                fatGrams = currentDish.effectiveBaseFat.toDouble()
             ),
             initialTimestamp = meal.timestamp,
-            imagePaths = meal.imagePaths,
+            imagePaths = if (dishes.size > 1 && currentDish.imagePath != null) listOf(currentDish.imagePath) else meal.imagePaths,
             apiKey = apiKey,
             visionService = viewModel.visionService,
-            title = "Review AI Estimate",
-            confirmButtonText = "Save Changes",
-            onConfirm = { desc, cal, pro, carb, fat, timestamp ->
+            title = if (dishes.size > 1) "Edit Dish (${selectedDishIndex + 1} of ${dishes.size})" else "Review AI Estimate",
+            confirmButtonText = "Save",
+            initialMultiplier = currentDish.multiplier,
+            initialBaseCalories = currentDish.effectiveBaseCalories,
+            initialBaseProtein = currentDish.effectiveBaseProtein,
+            initialBaseCarbs = currentDish.effectiveBaseCarbs,
+            initialBaseFat = currentDish.effectiveBaseFat,
+            dishTabs = if (dishes.size > 1) dishes.map {
+                val multStr = if (it.multiplier != 1.0f) " (${if (it.multiplier % 1f == 0f) it.multiplier.toInt() else it.multiplier}x)" else ""
+                "${it.description.ifBlank { "Dish" }}$multStr"
+            } else emptyList(),
+            selectedDishIndex = selectedDishIndex,
+            onSelectDishTab = { selectedDishIndex = it },
+            onConfirm = { desc, cal, pro, carb, fat, timestamp, mult, baseCal, basePro, baseCarb, baseFat ->
                 val dateStr = Instant.ofEpochMilli(timestamp)
                     .atZone(ZoneId.systemDefault())
                     .toLocalDate()
                     .toString()
-                viewModel.updateMeal(
-                    meal.copy(
+
+                if (dishes.size > 1) {
+                    val updatedDishes = dishes.toMutableList()
+                    updatedDishes[selectedDishIndex] = currentDish.copy(
                         description = desc,
                         calories = cal,
                         protein = pro,
                         carbs = carb,
                         fat = fat,
-                        timestamp = timestamp,
-                        dateString = dateStr
+                        multiplier = mult,
+                        baseCalories = baseCal,
+                        baseProtein = basePro,
+                        baseCarbs = baseCarb,
+                        baseFat = baseFat
                     )
-                )
+                    viewModel.updateMeal(
+                        meal.copy(
+                            description = updatedDishes.joinToString(" + ") { it.description },
+                            calories = updatedDishes.sumOf { it.calories },
+                            protein = updatedDishes.sumOf { it.protein },
+                            carbs = updatedDishes.sumOf { it.carbs },
+                            fat = updatedDishes.sumOf { it.fat },
+                            timestamp = timestamp,
+                            dateString = dateStr,
+                            dishes = updatedDishes
+                        )
+                    )
+                } else {
+                    val updatedDish = DishEntry(
+                        imagePath = meal.imagePaths.firstOrNull(),
+                        description = desc,
+                        calories = cal,
+                        protein = pro,
+                        carbs = carb,
+                        fat = fat,
+                        multiplier = mult,
+                        baseCalories = baseCal,
+                        baseProtein = basePro,
+                        baseCarbs = baseCarb,
+                        baseFat = baseFat
+                    )
+                    viewModel.updateMeal(
+                        meal.copy(
+                            description = desc,
+                            calories = cal,
+                            protein = pro,
+                            carbs = carb,
+                            fat = fat,
+                            timestamp = timestamp,
+                            dateString = dateStr,
+                            dishes = listOf(updatedDish)
+                        )
+                    )
+                }
                 editingMeal = null
             },
             onDismiss = { editingMeal = null }
+        )
+    }
+
+    // Duplicate Meal Dialog (opens calendar and hour dialogue)
+    mealToDuplicate?.let { meal ->
+        DuplicateMealDialog(
+            meal = meal,
+            onConfirm = { targetDate, targetHour, targetMinute ->
+                viewModel.duplicateMeal(meal, targetDate, targetHour, targetMinute)
+                mealToDuplicate = null
+            },
+            onDismiss = { mealToDuplicate = null }
+        )
+    }
+
+    // Manual Meal Entry Dialog
+    if (showManualEntryDialog) {
+        ManualEntryDialog(
+            initialDescription = userNote,
+            initialDate = selectedDate,
+            apiKey = apiKey,
+            visionService = viewModel.visionService,
+            onConfirm = { desc, cal, pro, carb, fat, targetDate, hour, minute, mult, baseCal, basePro, baseCarb, baseFat ->
+                viewModel.insertManualMeal(
+                    description = desc,
+                    calories = cal,
+                    protein = pro,
+                    carbs = carb,
+                    fat = fat,
+                    targetDate = targetDate,
+                    hour = hour,
+                    minute = minute,
+                    multiplier = mult,
+                    baseCalories = baseCal,
+                    baseProtein = basePro,
+                    baseCarbs = baseCarb,
+                    baseFat = baseFat
+                )
+                userNote = ""
+                showManualEntryDialog = false
+            },
+            onDismiss = { showManualEntryDialog = false }
         )
     }
 
@@ -1376,17 +1809,75 @@ fun ReviewAnalysisDialog(
     visionService: FoodVisionService? = null,
     title: String = "Review AI Estimate",
     confirmButtonText: String = "Log Meal",
-    onConfirm: (String, Int, Int, Int, Int, Long) -> Unit,
+    initialMultiplier: Float = 1.0f,
+    initialBaseCalories: Int? = null,
+    initialBaseProtein: Int? = null,
+    initialBaseCarbs: Int? = null,
+    initialBaseFat: Int? = null,
+    targetMeal: MealEntry? = null,
+    dishTabs: List<String> = emptyList(),
+    selectedDishIndex: Int = 0,
+    onSelectDishTab: (Int) -> Unit = {},
+    onConfirm: (
+        description: String,
+        calories: Int,
+        protein: Int,
+        carbs: Int,
+        fat: Int,
+        timestamp: Long,
+        multiplier: Float,
+        baseCalories: Int,
+        baseProtein: Int,
+        baseCarbs: Int,
+        baseFat: Int
+    ) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var desc by remember { mutableStateOf(analysis.mealDescription) }
-    var calories by remember { mutableStateOf(analysis.totalCaloriesInt.toString()) }
-    var protein by remember { mutableStateOf(analysis.proteinGramsInt.toString()) }
-    var carbs by remember { mutableStateOf(analysis.carbsGramsInt.toString()) }
-    var fat by remember { mutableStateOf(analysis.fatGramsInt.toString()) }
+    val baseCalories = remember(analysis, initialBaseCalories) {
+        initialBaseCalories ?: analysis.totalCaloriesInt
+    }
+    val baseProtein = remember(analysis, initialBaseProtein) {
+        initialBaseProtein ?: analysis.proteinGramsInt
+    }
+    val baseCarbs = remember(analysis, initialBaseCarbs) {
+        initialBaseCarbs ?: analysis.carbsGramsInt
+    }
+    val baseFat = remember(analysis, initialBaseFat) {
+        initialBaseFat ?: analysis.fatGramsInt
+    }
+
+    var multiplier by remember(analysis, initialMultiplier) { mutableFloatStateOf(initialMultiplier) }
+
+    var desc by remember(analysis) { mutableStateOf(analysis.mealDescription) }
+    var calories by remember(analysis, initialMultiplier, baseCalories) {
+        mutableStateOf((baseCalories * initialMultiplier).roundToInt().toString())
+    }
+    var protein by remember(analysis, initialMultiplier, baseProtein) {
+        mutableStateOf((baseProtein * initialMultiplier).roundToInt().toString())
+    }
+    var carbs by remember(analysis, initialMultiplier, baseCarbs) {
+        mutableStateOf((baseCarbs * initialMultiplier).roundToInt().toString())
+    }
+    var fat by remember(analysis, initialMultiplier, baseFat) {
+        mutableStateOf((baseFat * initialMultiplier).roundToInt().toString())
+    }
+
+    var showCustomMultiplierDialog by remember { mutableStateOf(false) }
+    var customMultiplierInput by remember { mutableStateOf("") }
+
+    fun applyMultiplier(m: Float) {
+        val newCal = (baseCalories * m).roundToInt()
+        val newPro = (baseProtein * m).roundToInt()
+        val newCarb = (baseCarbs * m).roundToInt()
+        val newFat = (baseFat * m).roundToInt()
+        calories = newCal.toString()
+        protein = newPro.toString()
+        carbs = newCarb.toString()
+        fat = newFat.toString()
+    }
 
     // Parse initial hour and minute
     val initialDateTime = remember(initialTimestamp) {
@@ -1466,6 +1957,60 @@ fun ReviewAnalysisDialog(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                // Dish selector tabs when editing a multi-dish meal
+                if (dishTabs.size > 1) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "Select Dish to Edit / Scale:",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            items(dishTabs.size) { index ->
+                                val dishName = dishTabs[index]
+                                FilterChip(
+                                    selected = index == selectedDishIndex,
+                                    onClick = { onSelectDishTab(index) },
+                                    label = { Text("Dish ${index + 1}: $dishName", maxLines = 1) },
+                                    modifier = Modifier.height(32.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // If adding to an existing meal: Show existing meal summary banner
+                if (targetMeal != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f))
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                text = "Adding to: ${targetMeal.description}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            val thisCal = calories.toIntOrNull() ?: 0
+                            val totalCal = targetMeal.calories + thisCal
+                            Text(
+                                text = "Existing: ${targetMeal.calories} kcal  +  This dish: $thisCal kcal  =  $totalCal kcal total",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                    }
+                }
+
                 // Image Preview Card & Cropping Actions
                 if (currentBitmap != null && selectedImagePath != null) {
                     Card(
@@ -1653,10 +2198,131 @@ fun ReviewAnalysisDialog(
                     label = { Text("Meal Description") },
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                // Portion / Quantity Multiplier Card
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Dish Portion Multiplier",
+                                    fontWeight = FontWeight.SemiBold,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                val subtitleText = when {
+                                    Math.abs(multiplier - 1.0f) < 0.01f -> if (targetMeal != null) "100% of this dish photo (scales only this dish)" else "100% of photo estimate"
+                                    Math.abs(multiplier - 8.0f) < 0.05f -> "8x (ate ⅞ before photo / ⅛ in photo)"
+                                    Math.abs(multiplier - 4.0f) < 0.05f -> "4x (ate ¾ before photo / ¼ in photo)"
+                                    Math.abs(multiplier - 2.0f) < 0.05f -> "2x (ate ½ before photo / ½ in photo)"
+                                    else -> "${Math.round(multiplier * 100)}% of this dish photo"
+                                }
+                                Text(
+                                    text = subtitleText,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                FilledTonalIconButton(
+                                    onClick = {
+                                        val step = if (multiplier > 2.0f) 0.5f else 0.25f
+                                        val newMult = (multiplier - step).coerceAtLeast(0.25f)
+                                        val rounded = Math.round(newMult * 100f) / 100f
+                                        multiplier = rounded
+                                        applyMultiplier(rounded)
+                                    },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(Icons.Default.Remove, contentDescription = "Decrease portion", modifier = Modifier.size(16.dp))
+                                }
+
+                                Surface(
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.clickable {
+                                        customMultiplierInput = if (multiplier % 1.0f == 0.0f) multiplier.toInt().toString() else multiplier.toString()
+                                        showCustomMultiplierDialog = true
+                                    }
+                                ) {
+                                    Text(
+                                        text = String.format(Locale.US, "%.2fx", multiplier),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+
+                                FilledTonalIconButton(
+                                    onClick = {
+                                        val step = if (multiplier >= 2.0f) 0.5f else 0.25f
+                                        val newMult = (multiplier + step).coerceAtMost(20.0f)
+                                        val rounded = Math.round(newMult * 100f) / 100f
+                                        multiplier = rounded
+                                        applyMultiplier(rounded)
+                                    },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(Icons.Default.Add, contentDescription = "Increase portion", modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+
+                        // Quick preset chips including 4x and 8x
+                        val presets = listOf(0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 8.0f)
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            items(presets) { preset ->
+                                val isSelected = Math.abs(multiplier - preset) < 0.02f
+                                FilterChip(
+                                    selected = isSelected,
+                                    onClick = {
+                                        multiplier = preset
+                                        applyMultiplier(preset)
+                                    },
+                                    label = {
+                                        val labelText = if (preset % 1.0f == 0.0f) "${preset.toInt()}x" else "${preset}x"
+                                        Text(labelText, style = MaterialTheme.typography.labelSmall)
+                                    },
+                                    modifier = Modifier.height(30.dp)
+                                )
+                            }
+                            item {
+                                FilterChip(
+                                    selected = showCustomMultiplierDialog || (presets.none { Math.abs(multiplier - it) < 0.02f } && multiplier != 1.0f),
+                                    onClick = {
+                                        customMultiplierInput = if (multiplier % 1.0f == 0.0f) multiplier.toInt().toString() else multiplier.toString()
+                                        showCustomMultiplierDialog = true
+                                    },
+                                    label = { Text("Custom...", style = MaterialTheme.typography.labelSmall) },
+                                    modifier = Modifier.height(30.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = calories,
                     onValueChange = { calories = it },
-                    label = { Text("Calories (kcal)") },
+                    label = { Text("Calories for this dish (kcal)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -1724,7 +2390,12 @@ fun ReviewAnalysisDialog(
                     protein.toIntOrNull() ?: 0,
                     carbs.toIntOrNull() ?: 0,
                     fat.toIntOrNull() ?: 0,
-                    finalTimestamp
+                    finalTimestamp,
+                    multiplier,
+                    baseCalories,
+                    baseProtein,
+                    baseCarbs,
+                    baseFat
                 )
             }) {
                 Text(confirmButtonText)
@@ -1734,6 +2405,793 @@ fun ReviewAnalysisDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+
+    if (showCustomMultiplierDialog) {
+        AlertDialog(
+            onDismissRequest = { showCustomMultiplierDialog = false },
+            title = { Text("Custom Portion Multiplier") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Enter a portion multiplier for this dish (e.g. 8 if only 1/8 was photographed, 2 if half was eaten, 0.5 for half portion):",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedTextField(
+                        value = customMultiplierInput,
+                        onValueChange = { customMultiplierInput = it },
+                        label = { Text("Multiplier (e.g. 8, 1.5, 2.5)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val parsed = customMultiplierInput.toFloatOrNull()
+                    if (parsed != null && parsed > 0f) {
+                        multiplier = parsed
+                        applyMultiplier(parsed)
+                    }
+                    showCustomMultiplierDialog = false
+                }) {
+                    Text("Apply")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCustomMultiplierDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DuplicateMealDialog(
+    meal: MealEntry,
+    onConfirm: (targetDate: LocalDate, targetHour: Int, targetMinute: Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var targetDate by remember { mutableStateOf(LocalDate.now()) }
+    var showDatePicker by remember { mutableStateOf(false) }
+
+    // Initial hour & minute: default to the meal's original hour/minute
+    val originalDateTime = remember(meal.timestamp) {
+        Instant.ofEpochMilli(meal.timestamp).atZone(ZoneId.systemDefault()).toLocalDateTime()
+    }
+    var hourInput by remember { mutableStateOf(originalDateTime.format(DateTimeFormatter.ofPattern("HH"))) }
+    var minuteInput by remember { mutableStateOf(originalDateTime.format(DateTimeFormatter.ofPattern("mm"))) }
+
+    val dateFormatter = remember { DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy", Locale.getDefault()) }
+
+    if (showDatePicker) {
+        val datePickerState = rememberDatePickerState(
+            initialSelectedDateMillis = targetDate.atStartOfDay(ZoneId.of("UTC")).toInstant().toEpochMilli()
+        )
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    datePickerState.selectedDateMillis?.let { millis ->
+                        targetDate = Instant.ofEpochMilli(millis).atZone(ZoneId.of("UTC")).toLocalDate()
+                    }
+                    showDatePicker = false
+                }) {
+                    Text("OK")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDatePicker = false }) {
+                    Text("Cancel")
+                }
+            }
+        ) {
+            DatePicker(state = datePickerState)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.ContentCopy,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Text("Duplicate Meal", fontWeight = FontWeight.Bold)
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // Meal Info Card
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text(
+                            text = meal.description,
+                            fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = "${meal.calories} kcal  •  P: ${meal.protein}g  C: ${meal.carbs}g  F: ${meal.fat}g",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // Date Selection Section
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Target Date", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
+
+                    // Quick date presets
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        FilterChip(
+                            selected = targetDate == LocalDate.now(),
+                            onClick = { targetDate = LocalDate.now() },
+                            label = { Text("Today") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                        FilterChip(
+                            selected = targetDate == LocalDate.now().minusDays(1),
+                            onClick = { targetDate = LocalDate.now().minusDays(1) },
+                            label = { Text("Yesterday") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                    }
+
+                    // Clickable Date Display
+                    OutlinedCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showDatePicker = true },
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = targetDate.format(dateFormatter),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = "Tap to choose from calendar",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.CalendarMonth,
+                                contentDescription = "Open Calendar",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                }
+
+                // Time Selection Section
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Target Hour & Minute", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
+
+                    // Time quick presets
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        FilterChip(
+                            selected = hourInput == "08" && minuteInput == "30",
+                            onClick = { hourInput = "08"; minuteInput = "30" },
+                            label = { Text("Morning (8:30)") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                        FilterChip(
+                            selected = hourInput == "12" && minuteInput == "30",
+                            onClick = { hourInput = "12"; minuteInput = "30" },
+                            label = { Text("Noon (12:30)") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                        FilterChip(
+                            selected = hourInput == "19" && minuteInput == "00",
+                            onClick = { hourInput = "19"; minuteInput = "00" },
+                            label = { Text("Evening (19:00)") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                    }
+
+                    // Editable Hour & Minute fields
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = hourInput,
+                            onValueChange = { if (it.length <= 2) hourInput = it },
+                            label = { Text("Hour (0-23)") },
+                            modifier = Modifier.weight(1f),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true
+                        )
+                        Text(":", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+                        OutlinedTextField(
+                            value = minuteInput,
+                            onValueChange = { if (it.length <= 2) minuteInput = it },
+                            label = { Text("Minute (0-59)") },
+                            modifier = Modifier.weight(1f),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val h = hourInput.toIntOrNull()?.coerceIn(0, 23) ?: 8
+                val m = minuteInput.toIntOrNull()?.coerceIn(0, 59) ?: 0
+                onConfirm(targetDate, h, m)
+            }) {
+                Text("Duplicate Meal")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ManualEntryDialog(
+    initialDescription: String = "",
+    initialDate: LocalDate = LocalDate.now(),
+    apiKey: String = "",
+    visionService: FoodVisionService? = null,
+    onConfirm: (
+        description: String,
+        calories: Int,
+        protein: Int,
+        carbs: Int,
+        fat: Int,
+        targetDate: LocalDate,
+        hour: Int,
+        minute: Int,
+        multiplier: Float,
+        baseCalories: Int,
+        baseProtein: Int,
+        baseCarbs: Int,
+        baseFat: Int
+    ) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+
+    var desc by remember { mutableStateOf(initialDescription) }
+    var targetDate by remember { mutableStateOf(initialDate) }
+    var showDatePicker by remember { mutableStateOf(false) }
+
+    val now = remember { LocalDateTime.now() }
+    var hourInput by remember { mutableStateOf(now.format(DateTimeFormatter.ofPattern("HH"))) }
+    var minuteInput by remember { mutableStateOf(now.format(DateTimeFormatter.ofPattern("mm"))) }
+
+    var calories by remember { mutableStateOf("") }
+    var protein by remember { mutableStateOf("") }
+    var carbs by remember { mutableStateOf("") }
+    var fat by remember { mutableStateOf("") }
+
+    var baseCalories by remember { mutableIntStateOf(0) }
+    var baseProtein by remember { mutableIntStateOf(0) }
+    var baseCarbs by remember { mutableIntStateOf(0) }
+    var baseFat by remember { mutableIntStateOf(0) }
+
+    var multiplier by remember { mutableFloatStateOf(1.0f) }
+    var isEstimating by remember { mutableStateOf(false) }
+    var estimateStatusMessage by remember { mutableStateOf<String?>(null) }
+    var showCustomMultiplierDialog by remember { mutableStateOf(false) }
+    var customMultiplierInput by remember { mutableStateOf("") }
+
+    fun applyMultiplier(m: Float) {
+        if (baseCalories > 0) {
+            val newCal = (baseCalories * m).roundToInt()
+            val newPro = (baseProtein * m).roundToInt()
+            val newCarb = (baseCarbs * m).roundToInt()
+            val newFat = (baseFat * m).roundToInt()
+            calories = newCal.toString()
+            protein = newPro.toString()
+            carbs = newCarb.toString()
+            fat = newFat.toString()
+        }
+    }
+
+    val dateFormatter = remember { DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy", Locale.getDefault()) }
+
+    if (showDatePicker) {
+        val datePickerState = rememberDatePickerState(
+            initialSelectedDateMillis = targetDate.atStartOfDay(ZoneId.of("UTC")).toInstant().toEpochMilli()
+        )
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    datePickerState.selectedDateMillis?.let { millis ->
+                        targetDate = Instant.ofEpochMilli(millis).atZone(ZoneId.of("UTC")).toLocalDate()
+                    }
+                    showDatePicker = false
+                }) {
+                    Text("OK")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDatePicker = false }) {
+                    Text("Cancel")
+                }
+            }
+        ) {
+            DatePicker(state = datePickerState)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.EditNote,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Text("Manual Meal Entry", fontWeight = FontWeight.Bold)
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // Dish Description input
+                OutlinedTextField(
+                    value = desc,
+                    onValueChange = { desc = it },
+                    label = { Text("Dish Description") },
+                    placeholder = { Text("e.g. 2 fried eggs, 2 slices of bacon, buttered toast") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // AI Estimation Button
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = {
+                            if (desc.isBlank()) {
+                                estimateStatusMessage = "Please describe the dish first."
+                                return@Button
+                            }
+                            if (apiKey.isBlank()) {
+                                estimateStatusMessage = "Gemini API key is required. Set it in Settings."
+                                return@Button
+                            }
+                            if (visionService == null) {
+                                estimateStatusMessage = "Vision service not available."
+                                return@Button
+                            }
+                            isEstimating = true
+                            estimateStatusMessage = "Estimating nutrition with AI..."
+                            scope.launch {
+                                val result = visionService.analyzeFoodText(apiKey, desc)
+                                result.onSuccess { analysis ->
+                                    baseCalories = analysis.totalCaloriesInt
+                                    baseProtein = analysis.proteinGramsInt
+                                    baseCarbs = analysis.carbsGramsInt
+                                    baseFat = analysis.fatGramsInt
+                                    multiplier = 1.0f
+                                    calories = analysis.totalCaloriesInt.toString()
+                                    protein = analysis.proteinGramsInt.toString()
+                                    carbs = analysis.carbsGramsInt.toString()
+                                    fat = analysis.fatGramsInt.toString()
+                                    estimateStatusMessage = analysis.confidenceNote.ifBlank { "Estimated successfully!" }
+                                }.onFailure { err ->
+                                    estimateStatusMessage = "Estimation failed: ${err.message}"
+                                }
+                                isEstimating = false
+                            }
+                        },
+                        enabled = !isEstimating && desc.isNotBlank(),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        if (isEstimating) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Estimating...", style = MaterialTheme.typography.labelMedium)
+                        } else {
+                            Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Estimate with AI", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
+
+                if (estimateStatusMessage != null) {
+                    Text(
+                        text = estimateStatusMessage!!,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                // Portion Multiplier (shown if calories > 0)
+                if (baseCalories > 0 || calories.isNotBlank()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Portion Multiplier",
+                                        fontWeight = FontWeight.SemiBold,
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    val subtitleText = when {
+                                        Math.abs(multiplier - 1.0f) < 0.01f -> "100% of estimate"
+                                        Math.abs(multiplier - 8.0f) < 0.05f -> "8x portion"
+                                        Math.abs(multiplier - 2.0f) < 0.05f -> "2x portion"
+                                        else -> "${Math.round(multiplier * 100)}% portion"
+                                    }
+                                    Text(
+                                        text = subtitleText,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    FilledTonalIconButton(
+                                        onClick = {
+                                            val step = if (multiplier > 2.0f) 0.5f else 0.25f
+                                            val newMult = (multiplier - step).coerceAtLeast(0.25f)
+                                            val rounded = Math.round(newMult * 100f) / 100f
+                                            multiplier = rounded
+                                            applyMultiplier(rounded)
+                                        },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(Icons.Default.Remove, contentDescription = "Decrease portion", modifier = Modifier.size(16.dp))
+                                    }
+
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.clickable {
+                                            customMultiplierInput = if (multiplier % 1.0f == 0.0f) multiplier.toInt().toString() else multiplier.toString()
+                                            showCustomMultiplierDialog = true
+                                        }
+                                    ) {
+                                        Text(
+                                            text = String.format(Locale.US, "%.2fx", multiplier),
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+
+                                    FilledTonalIconButton(
+                                        onClick = {
+                                            val step = if (multiplier >= 2.0f) 0.5f else 0.25f
+                                            val newMult = (multiplier + step).coerceAtMost(20.0f)
+                                            val rounded = Math.round(newMult * 100f) / 100f
+                                            multiplier = rounded
+                                            applyMultiplier(rounded)
+                                        },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(Icons.Default.Add, contentDescription = "Increase portion", modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                            }
+
+                            // Quick preset chips
+                            val presets = listOf(0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 8.0f)
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                items(presets) { preset ->
+                                    val isSelected = Math.abs(multiplier - preset) < 0.02f
+                                    FilterChip(
+                                        selected = isSelected,
+                                        onClick = {
+                                            multiplier = preset
+                                            applyMultiplier(preset)
+                                        },
+                                        label = {
+                                            val labelText = if (preset % 1.0f == 0.0f) "${preset.toInt()}x" else "${preset}x"
+                                            Text(labelText, style = MaterialTheme.typography.labelSmall)
+                                        },
+                                        modifier = Modifier.height(30.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Calories and Macros Inputs
+                OutlinedTextField(
+                    value = calories,
+                    onValueChange = {
+                        calories = it
+                        baseCalories = it.toIntOrNull() ?: 0
+                    },
+                    label = { Text("Calories (kcal)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = protein,
+                        onValueChange = {
+                            protein = it
+                            baseProtein = it.toIntOrNull() ?: 0
+                        },
+                        label = { Text("Protein (g)") },
+                        modifier = Modifier.weight(1f),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
+                    OutlinedTextField(
+                        value = carbs,
+                        onValueChange = {
+                            carbs = it
+                            baseCarbs = it.toIntOrNull() ?: 0
+                        },
+                        label = { Text("Carbs (g)") },
+                        modifier = Modifier.weight(1f),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
+                    OutlinedTextField(
+                        value = fat,
+                        onValueChange = {
+                            fat = it
+                            baseFat = it.toIntOrNull() ?: 0
+                        },
+                        label = { Text("Fat (g)") },
+                        modifier = Modifier.weight(1f),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                // Date Selection Section
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Date", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        FilterChip(
+                            selected = targetDate == LocalDate.now(),
+                            onClick = { targetDate = LocalDate.now() },
+                            label = { Text("Today") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                        FilterChip(
+                            selected = targetDate == LocalDate.now().minusDays(1),
+                            onClick = { targetDate = LocalDate.now().minusDays(1) },
+                            label = { Text("Yesterday") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                    }
+
+                    OutlinedCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showDatePicker = true },
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = targetDate.format(dateFormatter),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = "Tap to choose from calendar",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.CalendarMonth,
+                                contentDescription = "Open Calendar",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                }
+
+                // Time Selection Section
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Time", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        FilterChip(
+                            selected = hourInput == "08" && minuteInput == "30",
+                            onClick = { hourInput = "08"; minuteInput = "30" },
+                            label = { Text("Morning (8:30)") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                        FilterChip(
+                            selected = hourInput == "12" && minuteInput == "30",
+                            onClick = { hourInput = "12"; minuteInput = "30" },
+                            label = { Text("Noon (12:30)") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                        FilterChip(
+                            selected = hourInput == "19" && minuteInput == "00",
+                            onClick = { hourInput = "19"; minuteInput = "00" },
+                            label = { Text("Evening (19:00)") },
+                            modifier = Modifier.height(32.dp)
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = hourInput,
+                            onValueChange = { if (it.length <= 2) hourInput = it },
+                            label = { Text("Hour (0-23)") },
+                            modifier = Modifier.weight(1f),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true
+                        )
+                        Text(":", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+                        OutlinedTextField(
+                            value = minuteInput,
+                            onValueChange = { if (it.length <= 2) minuteInput = it },
+                            label = { Text("Minute (0-59)") },
+                            modifier = Modifier.weight(1f),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val h = hourInput.toIntOrNull()?.coerceIn(0, 23) ?: 12
+                    val m = minuteInput.toIntOrNull()?.coerceIn(0, 59) ?: 0
+                    val cal = calories.toIntOrNull() ?: 0
+                    val pro = protein.toIntOrNull() ?: 0
+                    val carb = carbs.toIntOrNull() ?: 0
+                    val f = fat.toIntOrNull() ?: 0
+                    val baseCal = if (baseCalories > 0) baseCalories else cal
+                    val basePro = if (baseProtein > 0) baseProtein else pro
+                    val baseCarb = if (baseCarbs > 0) baseCarbs else carb
+                    val baseF = if (baseFat > 0) baseFat else f
+
+                    onConfirm(
+                        desc.trim(),
+                        cal,
+                        pro,
+                        carb,
+                        f,
+                        targetDate,
+                        h,
+                        m,
+                        multiplier,
+                        baseCal,
+                        basePro,
+                        baseCarb,
+                        baseF
+                    )
+                },
+                enabled = desc.isNotBlank()
+            ) {
+                Text("Log Meal")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+
+    if (showCustomMultiplierDialog) {
+        AlertDialog(
+            onDismissRequest = { showCustomMultiplierDialog = false },
+            title = { Text("Custom Portion Multiplier") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Enter a portion multiplier (e.g. 2 for double portion, 0.5 for half):",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedTextField(
+                        value = customMultiplierInput,
+                        onValueChange = { customMultiplierInput = it },
+                        label = { Text("Multiplier (e.g. 2, 1.5, 0.5)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val parsed = customMultiplierInput.toFloatOrNull()
+                    if (parsed != null && parsed > 0f) {
+                        multiplier = parsed
+                        applyMultiplier(parsed)
+                    }
+                    showCustomMultiplierDialog = false
+                }) {
+                    Text("Apply")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCustomMultiplierDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 @Composable
